@@ -1,5 +1,8 @@
 """Tests for direct semantic-extraction backend selection."""
 
+import io
+import json
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -129,6 +132,25 @@ def test_looks_like_context_exceeded_matches_common_messages():
 def test_looks_like_context_exceeded_ignores_unrelated_errors():
     for m in ["timeout", "rate limit", "401 unauthorized", "connection refused"]:
         assert not llm._looks_like_context_exceeded(RuntimeError(m)), m
+
+
+def test_should_retry_with_responses_on_unsupported_chat_errors(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_OPENAI_BASE_URL", "https://api.openai.com/v1")
+    exc = RuntimeError("Unsupported parameter: messages for /chat/completions")
+    assert llm._should_retry_with_responses(exc, backend="openai")
+
+
+def test_should_retry_with_responses_on_gateway_403_for_custom_base(monkeypatch):
+    # Keep this as a generic example gateway so tests never embed real internal hosts.
+    monkeypatch.setenv("GRAPHIFY_OPENAI_BASE_URL", "https://gateway.example/v1")
+    exc = RuntimeError("PermissionDeniedError <html><h1>403 Forbidden</h1></html>")
+    assert llm._should_retry_with_responses(exc, backend="openai")
+
+
+def test_should_not_retry_with_responses_on_official_openai_403(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_OPENAI_BASE_URL", "https://api.openai.com/v1")
+    exc = RuntimeError("PermissionDeniedError 403 Forbidden")
+    assert not llm._should_retry_with_responses(exc, backend="openai")
 
 
 def test_adaptive_retry_splits_on_context_exceeded(tmp_path):
@@ -325,6 +347,100 @@ def test_call_openai_compat_preserves_real_finish_reason(monkeypatch):
     assert result["nodes"] == [{"id": "a"}]
 
 
+class _FakeUrlopenResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def test_call_openai_responses_http_retries_transient_502(monkeypatch):
+    calls = {"n": 0}
+    sleeps = []
+    payload = {
+        "model": "gpt-5.4",
+        "output": [
+            {
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": '{"nodes":[{"id":"n1"}],"edges":[],"hyperedges":[]}',
+                    }
+                ]
+            }
+        ],
+        "usage": {"input_tokens": 11, "output_tokens": 22},
+    }
+
+    def fake_urlopen(req, timeout):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                502,
+                "Bad Gateway",
+                {},
+                io.BytesIO(b"<html><h1>502 Bad Gateway</h1></html>"),
+            )
+        return _FakeUrlopenResponse(json_bytes(payload))
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(llm.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    result = llm._call_openai_responses_http(
+        "https://gateway.example/v1",
+        "test-key",
+        {"model": "gpt-5.4", "input": "hello"},
+        timeout_s=30,
+        stream=False,
+    )
+
+    assert calls["n"] == 3
+    assert sleeps == [1.0, 2.0]
+    assert '"id":"n1"' in result["raw_content"].replace(" ", "")
+    assert result["input_tokens"] == 11
+    assert result["output_tokens"] == 22
+
+
+def test_call_openai_responses_http_does_not_retry_http_400(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(
+            req.full_url,
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":"bad request"}'),
+        )
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(llm.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match=r"HTTP 400"):
+        llm._call_openai_responses_http(
+            "https://gateway.example/v1",
+            "test-key",
+            {"model": "gpt-5.4", "input": "hello"},
+            timeout_s=30,
+            stream=False,
+        )
+
+    assert calls["n"] == 1
+
+
+def json_bytes(payload: dict) -> bytes:
+    return json.dumps(payload).encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Ollama context-window fix (#798): num_ctx + keep_alive in extra_body,
 # serial execution by default.
@@ -476,6 +592,40 @@ def test_extract_corpus_parallel_ollama_parallel_env_restores_concurrency(tmp_pa
                 pass  # mock scaffolding may not be complete; we only care about the call
 
     mock_pool.assert_called()
+
+
+def test_extract_corpus_parallel_reports_failed_chunk_files(tmp_path):
+    files = [tmp_path / f"f{i}.md" for i in range(4)]
+    for f in files:
+        f.write_text("hello")
+
+    def fake_extract(chunk, *_, **__):
+        if chunk[0] == files[0]:
+            raise RuntimeError("boom")
+        return _ok(nodes=[{"id": f.stem} for f in chunk])
+
+    with patch("graphify.llm.extract_files_direct", side_effect=fake_extract):
+        result = llm.extract_corpus_parallel(
+            files,
+            backend="kimi",
+            api_key="k",
+            model="m",
+            root=tmp_path,
+            token_budget=None,
+            chunk_size=2,
+            max_concurrency=1,
+        )
+
+    assert result["failed_chunks"] == 1
+    assert result["failed_chunk_details"] == [
+        {
+            "chunk_index": 1,
+            "total_chunks": 2,
+            "files": [str(files[0]), str(files[1])],
+            "error": "boom",
+        }
+    ]
+    assert {node["id"] for node in result["nodes"]} == {"f2", "f3"}
 
 
 def test_adaptive_retry_bisects_on_hollow_ollama_response(tmp_path):

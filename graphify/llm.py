@@ -9,6 +9,8 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -22,6 +24,11 @@ _PER_FILE_OVERHEAD_CHARS = 80
 # Coarse fallback used only when `tiktoken` is not installed. 1 token ≈ 4 chars
 # is the standard heuristic for English/code on BPE tokenizers.
 _CHARS_PER_TOKEN = 4
+DEFAULT_TOKEN_BUDGET = 60_000
+_RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_RESPONSES_HTTP_MAX_ATTEMPTS = 3
+_RESPONSES_HTTP_BASE_DELAY_S = 1.0
+_RESPONSES_HTTP_MAX_DELAY_S = 8.0
 
 
 def _get_tokenizer():
@@ -80,8 +87,11 @@ BACKENDS: dict[str, dict] = {
         "max_completion_tokens": 16384,
     },
     "openai": {
-        "base_url": "https://api.openai.com/v1",
-        "default_model": "gpt-4.1-mini",
+        "base_url": os.environ.get(
+            "GRAPHIFY_OPENAI_BASE_URL",
+            os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        ),
+        "default_model": "gpt-5.4",
         "env_key": "OPENAI_API_KEY",
         "model_env_key": "GRAPHIFY_OPENAI_MODEL",
         "pricing": {"input": 0.40, "output": 1.60},  # USD per 1M tokens
@@ -249,6 +259,254 @@ def _default_model_for_backend(backend: str) -> str:
     return cfg["default_model"]
 
 
+def _base_url_for_backend(backend: str) -> str:
+    """Return configured base URL override or backend default."""
+    cfg = BACKENDS[backend]
+    if backend == "ollama":
+        return os.environ.get("OLLAMA_BASE_URL", cfg.get("base_url", ""))
+    if backend == "openai":
+        return os.environ.get(
+            "GRAPHIFY_OPENAI_BASE_URL",
+            os.environ.get("OPENAI_BASE_URL", cfg.get("base_url", "")),
+        )
+    return cfg.get("base_url", "")
+
+
+def _openai_api_style_for_backend(backend: str) -> str:
+    """Return API style for OpenAI-compatible backends: chat, responses, or auto."""
+    if backend != "openai":
+        return "chat"
+    style = os.environ.get("GRAPHIFY_OPENAI_API_STYLE", "auto").strip().lower()
+    if style in {"chat", "responses", "auto"}:
+        return style
+    return "auto"
+
+
+def _openai_responses_mode_for_backend(backend: str) -> str:
+    """Return responses transport mode: nonstream, stream, or auto."""
+    if backend != "openai":
+        return "nonstream"
+    mode = os.environ.get("GRAPHIFY_OPENAI_RESPONSES_MODE", "auto").strip().lower()
+    if mode in {"nonstream", "stream", "auto"}:
+        return mode
+    return "auto"
+
+
+def _should_retry_with_responses(exc: Exception, *, backend: str) -> bool:
+    """True when an OpenAI-compatible gateway rejects chat-style parameters."""
+    if backend != "openai":
+        return False
+    msg = str(exc).lower()
+    if (
+        "unsupported parameter: messages" in msg
+        or "unsupported parameter: prompt" in msg
+        or "/chat/completions" in msg and "unsupported" in msg
+    ):
+        return True
+    # Some OpenAI-compatible gateways accept raw /responses HTTP calls but
+    # reject the Python SDK transport for /chat or /responses with generic
+    # 403/404/405 errors. When the user explicitly configured a non-official
+    # base URL, allow the same raw-HTTP fallback path that we already use for
+    # unsupported chat-parameter errors.
+    base_url = (_base_url_for_backend(backend) or "").lower()
+    custom_gateway = bool(base_url) and "api.openai.com" not in base_url
+    if not custom_gateway:
+        return False
+    return (
+        "403" in msg
+        or "404" in msg
+        or "405" in msg
+        or "forbidden" in msg
+        or "not found" in msg
+        or "method not allowed" in msg
+        or "permissiondeniederror" in msg
+    )
+
+
+def _response_usage_tokens(usage: object, field: str) -> int:
+    """Best-effort token extraction across SDK object/dict variants."""
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        value = usage.get(field, 0) or 0
+        return int(value)
+    return int(getattr(usage, field, 0) or 0)
+
+
+def _responses_output_text(resp: object) -> str:
+    """Extract plain text from a Responses API object."""
+    text = getattr(resp, "output_text", None)
+    if text:
+        return text
+    output = getattr(resp, "output", None)
+    if output is None and isinstance(resp, dict):
+        output = resp.get("output")
+    if not output:
+        return ""
+    parts: list[str] = []
+    for item in output:
+        content = getattr(item, "content", None)
+        if content is None and isinstance(item, dict):
+            content = item.get("content")
+        if not content:
+            continue
+        for block in content:
+            block_type = getattr(block, "type", None)
+            if block_type is None and isinstance(block, dict):
+                block_type = block.get("type")
+            if block_type not in {"output_text", "text"}:
+                continue
+            value = getattr(block, "text", None)
+            if value is None and isinstance(block, dict):
+                value = block.get("text")
+            if value:
+                parts.append(value)
+    return "".join(parts)
+
+
+def _response_model_name(resp: object, fallback: str) -> str:
+    """Extract model name from dict/object response payload."""
+    if isinstance(resp, dict):
+        return str(resp.get("model") or fallback)
+    return str(getattr(resp, "model", fallback) or fallback)
+
+
+def _http_error_details(exc: urllib.error.HTTPError) -> str:
+    """Return HTTP status + truncated body for urllib HTTP errors."""
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = str(exc)
+    return f"HTTP {exc.code}: {body[:1000]}"
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError) -> float | None:
+    """Parse Retry-After seconds from an HTTP error response when present."""
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_openai_responses_http(
+    base_url: str,
+    api_key: str,
+    payload: dict,
+    *,
+    timeout_s: float,
+    stream: bool,
+) -> dict:
+    """Call /responses over raw HTTP for gateway compatibility."""
+    url = base_url.rstrip("/") + "/responses"
+    for attempt in range(1, _RESPONSES_HTTP_MAX_ATTEMPTS + 1):
+        body = dict(payload)
+        body["stream"] = stream
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                if not stream:
+                    payload_obj = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    usage = payload_obj.get("usage", {}) if isinstance(payload_obj, dict) else {}
+                    return {
+                        "raw_content": _responses_output_text(payload_obj),
+                        "input_tokens": _response_usage_tokens(usage, "input_tokens"),
+                        "output_tokens": _response_usage_tokens(usage, "output_tokens"),
+                        "model": _response_model_name(payload_obj, str(payload.get("model") or "")),
+                        "finish_reason": "stop",
+                        "response": payload_obj,
+                    }
+
+                text_parts: list[str] = []
+                final_response: dict | None = None
+                event_name = ""
+                data_lines: list[str] = []
+
+                def flush_event() -> None:
+                    nonlocal event_name, data_lines, final_response
+                    if not data_lines:
+                        event_name = ""
+                        return
+                    raw = "\n".join(data_lines)
+                    data_lines = []
+                    if raw == "[DONE]":
+                        event_name = ""
+                        return
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        event_name = ""
+                        return
+                    event_type = str(event.get("type") or event_name)
+                    if event_type == "response.output_text.delta":
+                        delta = event.get("delta")
+                        if isinstance(delta, str):
+                            text_parts.append(delta)
+                    elif event_type == "response.completed":
+                        maybe_resp = event.get("response")
+                        if isinstance(maybe_resp, dict):
+                            final_response = maybe_resp
+                    elif event_type == "response.output_text.done":
+                        text = event.get("text")
+                        if isinstance(text, str) and not text_parts:
+                            text_parts.append(text)
+                    event_name = ""
+
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line:
+                        flush_event()
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line.split(":", 1)[1].strip()
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line.split(":", 1)[1].lstrip())
+                flush_event()
+
+                usage = {}
+                model_name = str(payload.get("model") or "")
+                if isinstance(final_response, dict):
+                    usage = final_response.get("usage", {}) or {}
+                    model_name = _response_model_name(final_response, model_name)
+                return {
+                    "raw_content": "".join(text_parts),
+                    "input_tokens": _response_usage_tokens(usage, "input_tokens"),
+                    "output_tokens": _response_usage_tokens(usage, "output_tokens"),
+                    "model": model_name,
+                    "finish_reason": "stop",
+                    "response": final_response or {},
+                }
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code in _RETRYABLE_HTTP_STATUS_CODES
+            if attempt >= _RESPONSES_HTTP_MAX_ATTEMPTS or not retryable:
+                raise RuntimeError(_http_error_details(exc)) from exc
+            delay = _retry_after_seconds(exc)
+            if delay is None:
+                delay = min(
+                    _RESPONSES_HTTP_MAX_DELAY_S,
+                    _RESPONSES_HTTP_BASE_DELAY_S * (2 ** (attempt - 1)),
+                )
+            print(
+                f"[graphify] /responses HTTP {exc.code} from {url}; "
+                f"retrying attempt {attempt + 1}/{_RESPONSES_HTTP_MAX_ATTEMPTS} "
+                f"in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+
 def _call_openai_compat(
     base_url: str,
     api_key: str,
@@ -285,7 +543,7 @@ def _call_openai_compat(
         except ValueError:
             pass
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_s)
-    kwargs: dict = {
+    chat_kwargs: dict = {
         "model": model,
         "messages": [
             {"role": "system", "content": _EXTRACTION_SYSTEM},
@@ -293,13 +551,22 @@ def _call_openai_compat(
         ],
         "max_completion_tokens": max_completion_tokens,
     }
+    responses_kwargs: dict = {
+        "model": model,
+        "instructions": _EXTRACTION_SYSTEM,
+        "input": user_message,
+        "max_output_tokens": max_completion_tokens,
+    }
     if temperature is not None:
-        kwargs["temperature"] = temperature
+        chat_kwargs["temperature"] = temperature
+        responses_kwargs["temperature"] = temperature
     if reasoning_effort is not None:
-        kwargs["reasoning_effort"] = reasoning_effort
+        chat_kwargs["reasoning_effort"] = reasoning_effort
+        responses_kwargs["reasoning"] = {"effort": reasoning_effort}
     # Kimi-k2.6 is a reasoning model — disable thinking so content isn't empty
     if "moonshot" in base_url:
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        chat_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        responses_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     # Ollama defaults num_ctx to 2048 and silently truncates prompts larger
     # than that — the symptom is hollow 200 OK responses after the first few
     # chunks (#798). We derive num_ctx from the actual prompt size so we don't
@@ -307,7 +574,7 @@ def _call_openai_compat(
     # prompt on a 31B model) exhausts VRAM by chunk 4 and produces the same
     # hollow-200 symptom — just from a different direction (#798 follow-up).
     # Formula: actual input tokens + output cap + system prompt headroom.
-    # Capped at 131072 (enough for the default 60k token_budget); env var wins.
+    # Capped at 131072 (well above the default 60k token_budget); env var wins.
     if backend == "ollama":
         num_ctx_raw = os.environ.get("GRAPHIFY_OLLAMA_NUM_CTX", "").strip()
         # Auto-derive num_ctx from actual chunk size regardless — used as the
@@ -343,17 +610,79 @@ def _call_openai_compat(
             # heuristic) + 400 for the system prompt, then add output headroom.
             num_ctx = auto_num_ctx
         keep_alive = os.environ.get("GRAPHIFY_OLLAMA_KEEP_ALIVE", "30m")
-        kwargs["extra_body"] = {"options": {"num_ctx": num_ctx}, "keep_alive": keep_alive}
-    resp = client.chat.completions.create(**kwargs)
-    raw_content = resp.choices[0].message.content
-    result = _parse_llm_json(raw_content or "{}")
-    result["input_tokens"] = resp.usage.prompt_tokens if resp.usage else 0
-    result["output_tokens"] = resp.usage.completion_tokens if resp.usage else 0
+        extra_body = {"options": {"num_ctx": num_ctx}, "keep_alive": keep_alive}
+        chat_kwargs["extra_body"] = extra_body
+        responses_kwargs["extra_body"] = extra_body
+    style = _openai_api_style_for_backend(backend)
+    use_responses = style == "responses"
+    responses_mode = _openai_responses_mode_for_backend(backend)
+    raw_content = ""
+    result: dict
+    finish_reason = "stop"
+    input_tokens = 0
+    output_tokens = 0
+    try:
+        if use_responses:
+            response_result = _call_openai_responses_http(
+                base_url,
+                api_key,
+                responses_kwargs,
+                timeout_s=timeout_s,
+                stream=responses_mode == "stream",
+            )
+            raw_content = response_result["raw_content"]
+            result = _parse_llm_json(raw_content or "{}")
+            input_tokens = response_result["input_tokens"]
+            output_tokens = response_result["output_tokens"]
+            model = response_result["model"] or model
+        else:
+            resp = client.chat.completions.create(**chat_kwargs)
+            raw_content = resp.choices[0].message.content or ""
+            result = _parse_llm_json(raw_content or "{}")
+            input_tokens = resp.usage.prompt_tokens if resp.usage else 0
+            output_tokens = resp.usage.completion_tokens if resp.usage else 0
+            finish_reason = resp.choices[0].finish_reason
+    except Exception as exc:
+        if style == "auto" and _should_retry_with_responses(exc, backend=backend):
+            first_stream = responses_mode == "stream"
+            response_result = _call_openai_responses_http(
+                base_url,
+                api_key,
+                responses_kwargs,
+                timeout_s=timeout_s,
+                stream=first_stream,
+            )
+            raw_content = response_result["raw_content"]
+            input_tokens = response_result["input_tokens"]
+            output_tokens = response_result["output_tokens"]
+            model = response_result["model"] or model
+            if (
+                responses_mode == "auto"
+                and not raw_content.strip()
+                and output_tokens > 0
+            ):
+                response_result = _call_openai_responses_http(
+                    base_url,
+                    api_key,
+                    responses_kwargs,
+                    timeout_s=timeout_s,
+                    stream=True,
+                )
+                raw_content = response_result["raw_content"]
+                input_tokens = response_result["input_tokens"]
+                output_tokens = response_result["output_tokens"]
+                model = response_result["model"] or model
+            result = _parse_llm_json(raw_content or "{}")
+            use_responses = True
+        else:
+            raise
+    result["input_tokens"] = input_tokens
+    result["output_tokens"] = output_tokens
     result["model"] = model
     # `finish_reason == "length"` means the model hit max_completion_tokens
     # mid-generation. The JSON we got back is truncated; callers should
     # treat this as a signal to retry with smaller input.
-    result["finish_reason"] = resp.choices[0].finish_reason
+    result["finish_reason"] = finish_reason
     # An overwhelmed local model (typically Ollama) can return HTTP 200 with
     # empty / null content or unparseable half-generated JSON. The call looks
     # successful, `finish_reason` is `"stop"`, and the chunk would be silently
@@ -428,7 +757,8 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192) -> dict:
     import shutil
     import subprocess
 
-    if shutil.which("claude") is None:
+    claude_path = shutil.which("claude")
+    if claude_path is None:
         raise RuntimeError(
             "Claude Code CLI not found on $PATH. Install from "
             "https://claude.ai/code and run `claude` once to authenticate."
@@ -436,7 +766,7 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192) -> dict:
 
     proc = subprocess.run(
         [
-            "claude", "-p",
+            claude_path, "-p",
             "--output-format", "json",
             "--no-session-persistence",
             "--append-system-prompt", _EXTRACTION_SYSTEM,
@@ -549,7 +879,7 @@ def extract_files_direct(
         # Ollama ignores auth but the OpenAI client library requires a non-empty
         # string. Use a placeholder and surface a visible warning so this never
         # silently routes traffic without the user realising — see F-029.
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", cfg.get("base_url", ""))
+        ollama_url = _base_url_for_backend(backend)
         _validate_ollama_base_url(ollama_url)
         print(
             "[graphify] WARNING: ollama backend selected with no OLLAMA_API_KEY set; "
@@ -574,7 +904,7 @@ def extract_files_direct(
     if backend == "bedrock":
         return _call_bedrock(mdl, user_msg, max_tokens=max_out)
     return _call_openai_compat(
-        cfg["base_url"],
+        _base_url_for_backend(backend),
         key,
         mdl,
         user_msg,
@@ -816,7 +1146,7 @@ def extract_corpus_parallel(
     root: Path = Path("."),
     chunk_size: int = 20,
     on_chunk_done: Callable | None = None,
-    token_budget: int | None = 60_000,
+    token_budget: int | None = DEFAULT_TOKEN_BUDGET,
     max_concurrency: int = 4,
     max_retry_depth: int = 3,
 ) -> dict:
@@ -863,6 +1193,7 @@ def extract_corpus_parallel(
         "nodes": [], "edges": [], "hyperedges": [],
         "input_tokens": 0, "output_tokens": 0,
         "failed_chunks": 0,  # count of chunks that raised — loud failure on chunk errors
+        "failed_chunk_details": [],
     }
     total = len(chunks)
 
@@ -900,6 +1231,14 @@ def extract_corpus_parallel(
             if exc is not None:
                 print(f"[graphify] chunk {idx + 1}/{total} failed: {exc}", file=sys.stderr)
                 merged["failed_chunks"] += 1
+                merged["failed_chunk_details"].append(
+                    {
+                        "chunk_index": idx + 1,
+                        "total_chunks": total,
+                        "files": [str(p) for p in chunk],
+                        "error": str(exc),
+                    }
+                )
                 continue
             assert result is not None
             _merge_into(merged, result)
@@ -916,6 +1255,14 @@ def extract_corpus_parallel(
                         file=sys.stderr,
                     )
                     merged["failed_chunks"] += 1
+                    merged["failed_chunk_details"].append(
+                        {
+                            "chunk_index": idx + 1,
+                            "total_chunks": total,
+                            "files": [str(p) for p in chunks[idx]],
+                            "error": str(exc),
+                        }
+                    )
                     continue
                 assert result is not None
                 _merge_into(merged, result)
@@ -960,7 +1307,7 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
     cfg = BACKENDS[backend]
     key = _get_backend_api_key(backend)
     if not key and backend == "ollama":
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", cfg.get("base_url", ""))
+        ollama_url = _base_url_for_backend(backend)
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
     if not key and backend not in ("bedrock", "claude-cli"):
@@ -984,10 +1331,11 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
 
     if backend == "claude-cli":
         import shutil, subprocess
-        if shutil.which("claude") is None:
+        claude_path = shutil.which("claude")
+        if claude_path is None:
             raise RuntimeError("Claude Code CLI not found on $PATH")
         proc = subprocess.run(
-            ["claude", "-p", "--output-format", "json", "--no-session-persistence"],
+            [claude_path, "-p", "--output-format", "json", "--no-session-persistence"],
             input=prompt,
             capture_output=True,
             text=True,
@@ -1024,21 +1372,61 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
         from openai import OpenAI
     except ImportError as exc:
         raise ImportError("openai package required for this backend") from exc
-    client = OpenAI(api_key=key, base_url=cfg["base_url"])
-    kwargs: dict = {
+    base_url = _base_url_for_backend(backend)
+    timeout_raw = os.environ.get("GRAPHIFY_API_TIMEOUT", "").strip()
+    timeout_s: float = 600.0
+    if timeout_raw:
+        try:
+            v = float(timeout_raw)
+            if v > 0:
+                timeout_s = v
+        except ValueError:
+            pass
+    client = OpenAI(api_key=key, base_url=base_url, timeout=timeout_s)
+    chat_kwargs: dict = {
         "model": mdl,
         "messages": [{"role": "user", "content": prompt}],
         "max_completion_tokens": max_tokens,
     }
+    responses_kwargs: dict = {
+        "model": mdl,
+        "input": prompt,
+        "max_output_tokens": max_tokens,
+    }
     temperature = cfg.get("temperature", 0)
     if temperature is not None:
-        kwargs["temperature"] = temperature
+        chat_kwargs["temperature"] = temperature
+        responses_kwargs["temperature"] = temperature
     if cfg.get("reasoning_effort"):
-        kwargs["reasoning_effort"] = cfg["reasoning_effort"]
-    if "moonshot" in cfg["base_url"]:
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-    resp = client.chat.completions.create(**kwargs)
-    return resp.choices[0].message.content or ""
+        chat_kwargs["reasoning_effort"] = cfg["reasoning_effort"]
+        responses_kwargs["reasoning"] = {"effort": cfg["reasoning_effort"]}
+    if "moonshot" in base_url:
+        chat_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        responses_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    style = _openai_api_style_for_backend(backend)
+    if style == "responses":
+        response_result = _call_openai_responses_http(
+            base_url,
+            key,
+            responses_kwargs,
+            timeout_s=timeout_s,
+            stream=False,
+        )
+        return response_result["raw_content"]
+    try:
+        resp = client.chat.completions.create(**chat_kwargs)
+        return resp.choices[0].message.content or ""
+    except Exception as exc:
+        if style == "auto" and _should_retry_with_responses(exc, backend=backend):
+            response_result = _call_openai_responses_http(
+                base_url,
+                key,
+                responses_kwargs,
+                timeout_s=timeout_s,
+                stream=False,
+            )
+            return response_result["raw_content"]
+        raise
 
 
 def estimate_cost(backend: str, input_tokens: int, output_tokens: int) -> float:

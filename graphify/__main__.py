@@ -7,6 +7,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
+from graphify.export import MAX_NODES_FOR_VIZ, _viz_node_limit
 
 try:
     from importlib.metadata import version as _pkg_version
@@ -21,6 +22,40 @@ _GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
 def _default_graph_path() -> str:
     return str(Path(_GRAPHIFY_OUT) / "graph.json")
+
+
+def _append_issue(
+    issues: list[dict[str, object]],
+    *,
+    stage: str,
+    item: str,
+    message: str,
+    impact: str,
+    partial: bool = False,
+) -> None:
+    issues.append(
+        {
+            "stage": stage,
+            "item": item,
+            "message": message,
+            "impact": impact,
+            "partial": partial,
+        }
+    )
+
+
+def _print_error_summary(issues: list[dict[str, object]]) -> None:
+    if not issues:
+        return
+    print("Error Summary:")
+    for issue in issues:
+        stage = str(issue.get("stage", "")).strip() or "unknown"
+        item = str(issue.get("item", "")).strip() or "unknown"
+        message = str(issue.get("message", "")).strip() or "unspecified"
+        impact = str(issue.get("impact", "")).strip() or "unspecified"
+        print(f"  - [{stage}] {item}: {message} | impact: {impact}")
+    partial = any(bool(issue.get("partial")) for issue in issues)
+    print("Result is partial; rerun recommended." if partial else "Result is complete.")
 
 
 def _check_skill_version(skill_dst: Path) -> None:
@@ -1233,7 +1268,7 @@ def main() -> None:
         print("                            (also: GRAPHIFY_FORCE=1 env var; use after refactors that delete code)")
         print("    --no-cluster            skip clustering, write raw extraction only")
         print("  cluster-only <path>     rerun clustering on an existing graph.json and regenerate report")
-        print("    --no-viz                skip graph.html generation (useful for >5000 node graphs / CI)")
+        print(f"    --no-viz                skip graph.html generation (useful for >{MAX_NODES_FOR_VIZ} node graphs / CI)")
         print("    --graph <path>          path to graph.json (default <path>/graphify-out/graph.json)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
@@ -2116,7 +2151,7 @@ def main() -> None:
         callflow_max_diagram_nodes = 18
         callflow_max_diagram_edges = 24
         analysis_path = Path(_GRAPHIFY_OUT) / ".graphify_analysis.json"
-        node_limit = 5000
+        node_limit = _viz_node_limit()
         no_viz = False
         obsidian_dir = Path(_GRAPHIFY_OUT) / "obsidian"
         neo4j_uri: str | None = None
@@ -2411,6 +2446,7 @@ def main() -> None:
         if not target.exists():
             print(f"error: path not found: {target}", file=sys.stderr)
             sys.exit(1)
+        run_issues: list[dict[str, object]] = []
 
         backend: str | None = None
         model: str | None = None
@@ -2656,6 +2692,14 @@ def main() -> None:
                 ast_result = _ast_extract(code_files, **ast_kwargs)
             except Exception as exc:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
+                _append_issue(
+                    run_issues,
+                    stage="ast",
+                    item="code extraction",
+                    message=str(exc),
+                    impact="AST nodes and edges were omitted from this run",
+                    partial=True,
+                )
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
 
         # Semantic extraction on docs/papers/images. Check cache first.
@@ -2669,6 +2713,7 @@ def main() -> None:
         }
         sem_cache_hits = 0
         sem_cache_misses = 0
+        failed_semantic_files: set[str] = set()
         if semantic_files:
             sem_paths_str = [str(p) for p in semantic_files]
             cached_nodes, cached_edges, cached_hyperedges, uncached_paths = (
@@ -2712,13 +2757,41 @@ def main() -> None:
                     )
                 except ImportError as exc:
                     print(f"error: {exc}", file=sys.stderr)
+                    _append_issue(
+                        run_issues,
+                        stage="semantic",
+                        item="backend import",
+                        message=str(exc),
+                        impact="semantic extraction could not start",
+                        partial=True,
+                    )
+                    _print_error_summary(run_issues)
                     sys.exit(1)
                 except Exception as exc:
                     print(
                         f"[graphify extract] semantic extraction failed: {exc}",
                         file=sys.stderr,
                     )
+                    _append_issue(
+                        run_issues,
+                        stage="semantic",
+                        item="corpus extraction",
+                        message=str(exc),
+                        impact="all semantic results were omitted from this run",
+                        partial=True,
+                    )
+                    failed_semantic_files.update(uncached_paths)
                     fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+                for detail in fresh.get("failed_chunk_details", []):
+                    failed_semantic_files.update(str(Path(f)) for f in detail.get("files", []))
+                    _append_issue(
+                        run_issues,
+                        stage="semantic",
+                        item=f"chunk {detail.get('chunk_index', '?')}/{detail.get('total_chunks', '?')}",
+                        message=str(detail.get("error", "unknown chunk failure")),
+                        impact="semantic results for this chunk were omitted",
+                        partial=True,
+                    )
                 try:
                     _save_semantic_cache(
                         fresh.get("nodes", []),
@@ -2728,6 +2801,13 @@ def main() -> None:
                     )
                 except Exception as exc:
                     print(f"[graphify extract] warning: could not write semantic cache: {exc}", file=sys.stderr)
+                    _append_issue(
+                        run_issues,
+                        stage="cache",
+                        item="semantic cache",
+                        message=str(exc),
+                        impact="semantic results were produced but not cached",
+                    )
                 sem_result["nodes"].extend(fresh.get("nodes", []))
                 sem_result["edges"].extend(fresh.get("edges", []))
                 sem_result["hyperedges"].extend(fresh.get("hyperedges", []))
@@ -2771,9 +2851,21 @@ def main() -> None:
                     f"est. cost: ${cost:.4f}"
                 )
             try:
-                _save_manifest(files_by_type, manifest_path=str(manifest_path), kind="both")
+                _save_manifest(
+                    files_by_type,
+                    manifest_path=str(manifest_path),
+                    kind="both",
+                    failed_semantic_files=failed_semantic_files,
+                )
             except Exception as exc:
                 print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+                _append_issue(
+                    run_issues,
+                    stage="manifest",
+                    item=str(manifest_path),
+                    message=str(exc),
+                    impact="incremental metadata was not fully updated",
+                )
             if global_merge:
                 from graphify.global_graph import global_add as _global_add
                 _tag = global_repo_tag or target.name
@@ -2786,6 +2878,14 @@ def main() -> None:
                               f"(+{result['nodes_added']} nodes, -{result['nodes_removed']} pruned).")
                 except Exception as exc:
                     print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
+                    _append_issue(
+                        run_issues,
+                        stage="global",
+                        item=_tag,
+                        message=str(exc),
+                        impact="local graph was written but global graph merge was skipped",
+                    )
+            _print_error_summary(run_issues)
             sys.exit(0)
 
         # Build graph + cluster + score + write.
@@ -2815,6 +2915,15 @@ def main() -> None:
                 "returned no edges.",
                 file=sys.stderr,
             )
+            _append_issue(
+                run_issues,
+                stage="build",
+                item="graph assembly",
+                message="extraction produced no nodes",
+                impact="no graph artifacts could be produced",
+                partial=True,
+            )
+            _print_error_summary(run_issues)
             sys.exit(1)
 
         communities = _cluster(G, resolution=cli_resolution, exclude_hubs_percentile=cli_exclude_hubs)
@@ -2841,6 +2950,13 @@ def main() -> None:
                           f"(+{result['nodes_added']} nodes, -{result['nodes_removed']} pruned).")
             except Exception as exc:
                 print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
+                _append_issue(
+                    run_issues,
+                    stage="global",
+                    item=_tag,
+                    message=str(exc),
+                    impact="local graph was written but global graph merge was skipped",
+                )
         analysis = {
             "communities": {str(k): v for k, v in communities.items()},
             "cohesion": {str(k): v for k, v in cohesion.items()},
@@ -2853,9 +2969,21 @@ def main() -> None:
         }
         analysis_path.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
         try:
-            _save_manifest(files_by_type, manifest_path=str(manifest_path), kind="both")
+            _save_manifest(
+                files_by_type,
+                manifest_path=str(manifest_path),
+                kind="both",
+                failed_semantic_files=failed_semantic_files,
+            )
         except Exception as exc:
             print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+            _append_issue(
+                run_issues,
+                stage="manifest",
+                item=str(manifest_path),
+                message=str(exc),
+                impact="incremental metadata was not fully updated",
+            )
 
         cost = _estimate_cost(backend, merged["input_tokens"], merged["output_tokens"])
         print(
@@ -2880,6 +3008,7 @@ def main() -> None:
                 f"{merged['output_tokens']:,} out, "
                 f"est. cost (~{backend}): ${cost:.4f}"
             )
+        _print_error_summary(run_issues)
 
     else:
         print(f"error: unknown command '{cmd}'", file=sys.stderr)

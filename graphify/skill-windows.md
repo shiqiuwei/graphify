@@ -623,7 +623,7 @@ Generate the HTML graph (always, unless `--no-viz`):
 @'
 import sys, json
 from graphify.build import build_from_json
-from graphify.export import to_html
+from graphify.export import to_html, _viz_node_limit
 from pathlib import Path
 
 extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding="utf-8"))
@@ -634,11 +634,14 @@ G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
 
-if G.number_of_nodes() > 5000:
-    print(f'Graph has {G.number_of_nodes()} nodes - too large for HTML viz. Use Obsidian vault instead.')
+limit = _viz_node_limit()
+if limit <= 0:
+    print('HTML viz disabled via GRAPHIFY_VIZ_NODE_LIMIT=0.')
 else:
-    to_html(G, communities, 'graphify-out/graph.html', community_labels=labels or None)
-    print('graph.html written - open in any browser, no server needed')
+    over_limit = G.number_of_nodes() > limit
+    to_html(G, communities, 'graphify-out/graph.html', community_labels=labels or None, node_limit=limit)
+    if not over_limit:
+        print('graph.html written - open in any browser, no server needed')
 '@ | Out-File -FilePath graphify-out\.graphify_step_6_generate_obsidian_vault_opt_in_12.py -Encoding utf8
 & (Get-Content graphify-out\.graphify_python) graphify-out\.graphify_step_6_generate_obsidian_vault_opt_in_12.py
 Remove-Item -ErrorAction SilentlyContinue graphify-out\.graphify_step_6_generate_obsidian_vault_opt_in_12.py
@@ -838,6 +841,13 @@ Then paste these sections from GRAPH_REPORT.md directly into the chat:
 - Suggested Questions
 
 Do NOT paste the full report - just those three sections. Keep it concise.
+
+After the normal success/failure output, always add an `Error Summary` section:
+- If no warnings or errors happened, say exactly: `Error Summary: none`
+- Otherwise list every collected warning/error in execution order, one per bullet
+- For each bullet include: stage, item, brief message, and impact
+- End the section with a one-line conclusion: either `Result is complete.` or `Result is partial; rerun recommended.` depending on whether any chunk/file/output was skipped or failed
+- This summary is mandatory even when the overall command succeeded
 
 Then immediately offer to explore. Pick the single most interesting suggested question from the report - the one that crosses the most community boundaries or has the most surprising bridge node - and ask:
 
@@ -1431,4 +1441,4 @@ If vertical scrolling breaks in PowerShell after running graphify, this is cause
 - Never skip the corpus check warning.
 - Always show token cost in the report.
 - Never hide cohesion scores behind symbols - show the raw number.
-- Never run HTML viz on a graph with more than 5,000 nodes without warning the user.
+- Never run HTML viz past the active `GRAPHIFY_VIZ_NODE_LIMIT` threshold without warning the user.

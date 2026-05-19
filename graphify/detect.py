@@ -5,6 +5,7 @@ import json
 import os
 import re
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 
 from graphify.google_workspace import (
@@ -475,6 +476,69 @@ def _load_graphifyignore(root: Path) -> list[tuple[Path, str]]:
     return patterns
 
 
+@lru_cache(maxsize=16_384)
+def _match_gitignore_parts(path_parts: tuple[str, ...], pattern_parts: tuple[str, ...]) -> bool:
+    """Match slash-separated path parts with gitignore-style ``**`` support."""
+
+    @lru_cache(maxsize=None)
+    def _match(path_idx: int, pattern_idx: int) -> bool:
+        while (
+            pattern_idx + 1 < len(pattern_parts)
+            and pattern_parts[pattern_idx] == "**"
+            and pattern_parts[pattern_idx + 1] == "**"
+        ):
+            pattern_idx += 1
+        if pattern_idx == len(pattern_parts):
+            return path_idx == len(path_parts)
+
+        part = pattern_parts[pattern_idx]
+        if part == "**":
+            if pattern_idx + 1 == len(pattern_parts):
+                return True
+            return _match(path_idx, pattern_idx + 1) or (
+                path_idx < len(path_parts) and _match(path_idx + 1, pattern_idx)
+            )
+
+        if path_idx >= len(path_parts):
+            return False
+        if not fnmatch.fnmatchcase(path_parts[path_idx], part):
+            return False
+        return _match(path_idx + 1, pattern_idx + 1)
+
+    return _match(0, 0)
+
+
+def _matches_gitignore_pattern(target: Path, anchor: Path, pattern: str) -> bool:
+    """Return True when one gitignore-style pattern matches ``target``."""
+    try:
+        rel = str(target.relative_to(anchor)).replace(os.sep, "/")
+    except ValueError:
+        return False
+
+    anchored = pattern.startswith("/")
+    directory_only = pattern.endswith("/")
+    body = pattern[1:] if anchored else pattern
+    if directory_only:
+        body = body[:-1]
+    body = body.strip("/")
+    if not body:
+        return False
+    if directory_only and not target.is_dir():
+        return False
+
+    # Patterns without slashes follow gitignore basename semantics anywhere
+    # below the anchor. Once a slash is present (or a leading / anchors the
+    # pattern), matching stays relative to the .graphifyignore directory.
+    if not anchored and "/" not in body:
+        return fnmatch.fnmatchcase(target.name, body)
+
+    path_parts = tuple(part for part in rel.split("/") if part)
+    pattern_parts = tuple(part for part in body.split("/") if part)
+    if not pattern_parts:
+        return False
+    return _match_gitignore_parts(path_parts, pattern_parts)
+
+
 def _is_ignored(path: Path, root: Path, patterns: list[tuple[Path, str]]) -> bool:
     """Return True if the path should be ignored per .graphifyignore patterns.
 
@@ -490,49 +554,11 @@ def _is_ignored(path: Path, root: Path, patterns: list[tuple[Path, str]]) -> boo
 
     def _eval(target: Path) -> bool:
         """Apply last-match-wins to a single target path."""
-        def _matches(rel: str, p: str) -> bool:
-            parts = rel.split("/")
-            if fnmatch.fnmatch(rel, p):
-                return True
-            if fnmatch.fnmatch(target.name, p):
-                return True
-            for i, part in enumerate(parts):
-                if fnmatch.fnmatch(part, p):
-                    return True
-                if fnmatch.fnmatch("/".join(parts[:i + 1]), p):
-                    return True
-            return False
-
         result = False
         for anchor, pattern in patterns:
             negated = pattern.startswith("!")
             raw = pattern[1:] if negated else pattern
-            anchored = raw.startswith("/")
-            p = raw.strip("/")
-            if not p:
-                continue
-
-            matched = False
-            if anchored:
-                try:
-                    rel_anchor = str(target.relative_to(anchor)).replace(os.sep, "/")
-                    matched = _matches(rel_anchor, p)
-                except ValueError:
-                    pass
-            else:
-                try:
-                    rel = str(target.relative_to(root)).replace(os.sep, "/")
-                    matched = _matches(rel, p)
-                except ValueError:
-                    pass
-                if not matched and anchor != root:
-                    try:
-                        rel_anchor = str(target.relative_to(anchor)).replace(os.sep, "/")
-                        matched = _matches(rel_anchor, p)
-                    except ValueError:
-                        pass
-
-            if matched:
+            if raw and _matches_gitignore_pattern(target, anchor, raw):
                 result = not negated  # last match wins; ! flips to un-ignore
         return result
 
@@ -845,6 +871,7 @@ def save_manifest(
     manifest_path: str = _MANIFEST_PATH,
     *,
     kind: str = "both",
+    failed_semantic_files: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> None:
     """Save current file mtimes + content hashes for change detection.
 
@@ -854,8 +881,12 @@ def save_manifest(
     kind="semantic" — written by `graphify extract` after semantic extraction.
                       Stamps semantic_hash; preserves existing ast_hash.
     kind="both"     — full pipeline: stamps both hashes (default).
+    failed_semantic_files — file paths whose semantic extraction failed during
+                      this run. These entries keep `semantic_hash` empty so the
+                      next incremental semantic pass re-extracts only them.
     """
     existing = load_manifest(manifest_path)
+    failed_semantic = {str(Path(f)) for f in (failed_semantic_files or ())}
 
     def _normalise_entry(entry):
         if isinstance(entry, (int, float)):
@@ -896,7 +927,7 @@ def save_manifest(
             else:
                 entry["ast_hash"] = prev.get("ast_hash", "")
             if kind in ("semantic", "both"):
-                entry["semantic_hash"] = h
+                entry["semantic_hash"] = "" if str(p) in failed_semantic else h
             else:
                 # Preserve semantic_hash only when content is unchanged
                 entry["semantic_hash"] = prev.get("semantic_hash", "") if h == prev.get("ast_hash", "") else ""

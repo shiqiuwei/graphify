@@ -256,7 +256,7 @@ def test_corpus_parallel_legacy_mode_when_token_budget_is_none(tmp_path):
 
 def test_corpus_parallel_token_budget_default_packs_files(tmp_path):
     """With the default token_budget, many tiny files pack into one chunk."""
-    from graphify.llm import extract_corpus_parallel
+    from graphify.llm import DEFAULT_TOKEN_BUDGET, _pack_chunks_by_tokens, extract_corpus_parallel
 
     files = []
     for i in range(50):
@@ -269,10 +269,12 @@ def test_corpus_parallel_token_budget_default_packs_files(tmp_path):
         chunks_seen.append(len(chunk))
         return _stub_chunk_result(len(chunk), len(chunks_seen))
 
-    with patch("graphify.llm.extract_files_direct", side_effect=record):
-        extract_corpus_parallel(files, backend="kimi", max_concurrency=1)
+    with patch("graphify.llm._pack_chunks_by_tokens", wraps=_pack_chunks_by_tokens) as pack_chunks:
+        with patch("graphify.llm.extract_files_direct", side_effect=record):
+            extract_corpus_parallel(files, backend="kimi", max_concurrency=1)
 
-    # 50 tiny files at default 60k token budget should pack into 1 chunk
+    assert pack_chunks.call_args.kwargs["token_budget"] == DEFAULT_TOKEN_BUDGET
+    # 50 tiny files at the default token budget should still pack into 1 chunk.
     assert len(chunks_seen) == 1
     assert chunks_seen[0] == 50
 

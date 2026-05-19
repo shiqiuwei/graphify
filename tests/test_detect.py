@@ -216,6 +216,58 @@ def test_graphifyignore_at_git_root_is_included(tmp_path):
     assert result["graphifyignore_patterns"] == 1
 
 
+def test_graphifyignore_anchored_pattern_only_matches_root_level_files(tmp_path):
+    """Leading / keeps matching anchored to the .graphifyignore directory."""
+    (tmp_path / ".graphifyignore").write_text("/*.js\n")
+    nested = tmp_path / "sub"
+    nested.mkdir()
+    (tmp_path / "root.js").write_text("console.log('root')")
+    (nested / "nested.js").write_text("console.log('nested')")
+
+    result = detect(tmp_path)
+    code_files = result["files"]["code"]
+
+    assert not any("root.js" in f for f in code_files)
+    assert any("nested.js" in f for f in code_files)
+
+
+def test_graphifyignore_can_allowlist_extension_with_standard_gitignore_pattern(tmp_path):
+    """`* !*/ !**/*.js` should keep only JS files at any depth."""
+    (tmp_path / ".graphifyignore").write_text("*\n!*/\n!**/*.js\n")
+    nested = tmp_path / "src"
+    nested.mkdir()
+    (tmp_path / "root.js").write_text("console.log('root')")
+    (tmp_path / "root.ts").write_text("console.log('root ts')")
+    (nested / "nested.js").write_text("console.log('nested')")
+    (nested / "nested.ts").write_text("console.log('nested ts')")
+
+    result = detect(tmp_path)
+    code_files = result["files"]["code"]
+
+    assert any("root.js" in f for f in code_files)
+    assert any("nested.js" in f for f in code_files)
+    assert not any("root.ts" in f for f in code_files)
+    assert not any("nested.ts" in f for f in code_files)
+
+
+def test_parent_graphifyignore_patterns_stay_anchored_to_parent_dir(tmp_path):
+    """Parent patterns with slashes stay relative to that parent directory."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / ".graphifyignore").write_text("sub/*.py\n")
+    scan_root = repo / "packages" / "mylib"
+    nested = scan_root / "sub"
+    nested.mkdir(parents=True)
+    (nested / "keep.py").write_text("x = 1")
+
+    result = detect(scan_root)
+    code_files = result["files"]["code"]
+
+    assert any("keep.py" in f for f in code_files)
+    assert result["graphifyignore_patterns"] == 1
+
+
 def test_detect_handles_circular_symlinks(tmp_path):
     sub = tmp_path / "a"
     sub.mkdir()
@@ -296,6 +348,36 @@ def test_detect_incremental_propagates_follow_symlinks(tmp_path, monkeypatch):
     save_manifest(yes_link["files"], manifest_path)
     second = detect_incremental(tmp_path, manifest_path, follow_symlinks=True)
     assert second["new_total"] == 0
+
+
+def test_failed_semantic_files_are_retried_on_next_incremental_extract(tmp_path):
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+    (tmp_path / "graphify-out").mkdir()
+
+    failed = tmp_path / "failed.md"
+    ok = tmp_path / "ok.md"
+    failed.write_text("# Failed\n\nretry me")
+    ok.write_text("# OK\n\nkeep cached")
+
+    files = {
+        "code": [],
+        "document": [str(failed), str(ok)],
+        "paper": [],
+        "image": [],
+        "video": [],
+    }
+    save_manifest(
+        files,
+        manifest_path,
+        kind="both",
+        failed_semantic_files={str(failed)},
+    )
+
+    result = detect_incremental(tmp_path, manifest_path, kind="semantic")
+
+    assert result["new_files"]["document"] == [str(failed)]
+    assert result["unchanged_files"]["document"] == [str(ok)]
+    assert result["new_total"] == 1
 
 
 def test_classify_video_extensions():

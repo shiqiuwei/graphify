@@ -11,6 +11,40 @@ from pathlib import Path
 _GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
 
+def _append_issue(
+    issues: list[dict[str, object]],
+    *,
+    stage: str,
+    item: str,
+    message: str,
+    impact: str,
+    partial: bool = False,
+) -> None:
+    issues.append(
+        {
+            "stage": stage,
+            "item": item,
+            "message": message,
+            "impact": impact,
+            "partial": partial,
+        }
+    )
+
+
+def _print_error_summary(issues: list[dict[str, object]], *, prefix: str = "[graphify watch]") -> None:
+    if not issues:
+        return
+    print(f"{prefix} Error Summary:")
+    for issue in issues:
+        stage = str(issue.get("stage", "")).strip() or "unknown"
+        item = str(issue.get("item", "")).strip() or "unknown"
+        message = str(issue.get("message", "")).strip() or "unspecified"
+        impact = str(issue.get("impact", "")).strip() or "unspecified"
+        print(f"  - [{stage}] {item}: {message} | impact: {impact}")
+    partial = any(bool(issue.get("partial")) for issue in issues)
+    print("Result is partial; rerun recommended." if partial else "Result is complete.")
+
+
 @contextlib.contextmanager
 def _rebuild_lock(out_dir: Path, *, blocking: bool = False):
     """Per-repo advisory lock around a rebuild.
@@ -316,6 +350,7 @@ def _rebuild_code(
     watch_root = watch_path.resolve()
     project_root = Path.cwd().resolve() if not watch_path.is_absolute() else watch_root
     report_root = _report_root_label(watch_path)
+    issues: list[dict[str, object]] = []
     try:
         from graphify.extract import extract, _get_extractor
         from graphify.detect import detect
@@ -435,6 +470,15 @@ def _rebuild_code(
                     same_graph = False
             if not same_graph:
                 if not _check_shrink(force, existing_graph_data, candidate_graph_data):
+                    _append_issue(
+                        issues,
+                        stage="guard",
+                        item="graph shrink check",
+                        message="new graph had fewer nodes than the existing graph; overwrite refused",
+                        impact="update aborted; rerun with --force if this shrink is expected",
+                        partial=True,
+                    )
+                    _print_error_summary(issues)
                     return False
                 existing_graph.write_text(candidate_graph_text, encoding="utf-8")
 
@@ -457,6 +501,7 @@ def _rebuild_code(
                     f"{len(result.get('nodes', []))} nodes, {len(result.get('edges', []))} edges"
                 )
                 print(f"[graphify watch] graph.json updated in {out}")
+            _print_error_summary(issues)
             return True
 
         detection = {
@@ -513,6 +558,15 @@ def _rebuild_code(
         graph_tmp = out / ".graph.tmp.json"
         json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit)
         if not json_written:
+            _append_issue(
+                issues,
+                stage="export",
+                item="graph.json",
+                message="graph JSON was not written",
+                impact="update aborted before outputs were finalized",
+                partial=True,
+            )
+            _print_error_summary(issues)
             return False
         candidate_graph_data = json.loads(graph_tmp.read_text(encoding="utf-8"))
         same_graph = False
@@ -535,6 +589,15 @@ def _rebuild_code(
             print("[graphify watch] No code-graph changes detected; graph.json/GRAPH_REPORT.md left untouched.")
         else:
             if not _check_shrink(force, existing_graph_data, candidate_graph_data, tmp=graph_tmp):
+                _append_issue(
+                    issues,
+                    stage="guard",
+                    item="graph shrink check",
+                    message="new graph had fewer nodes than the existing graph; overwrite refused",
+                    impact="update aborted; rerun with --force if this shrink is expected",
+                    partial=True,
+                )
+                _print_error_summary(issues)
                 return False
             graph_tmp.replace(existing_graph)
             report_path.write_text(report, encoding="utf-8")
@@ -555,6 +618,13 @@ def _rebuild_code(
                 html_written = True
             except ValueError as viz_err:
                 print(f"[graphify watch] Skipped graph.html: {viz_err}")
+                _append_issue(
+                    issues,
+                    stage="export",
+                    item="graph.html",
+                    message=str(viz_err),
+                    impact="core graph outputs were written; HTML visualization was skipped",
+                )
                 stale = out / "graph.html"
                 if stale.exists():
                     stale.unlink()
@@ -575,6 +645,13 @@ def _rebuild_code(
                     )
             except Exception as cf_err:
                 print(f"[graphify watch] callflow HTML update skipped: {cf_err}")
+                _append_issue(
+                    issues,
+                    stage="export",
+                    item="callflow HTML",
+                    message=str(cf_err),
+                    impact="core graph outputs were written; callflow HTML was skipped",
+                )
 
         # clear stale needs_update flag if present
         flag = out / "needs_update"
@@ -588,10 +665,20 @@ def _rebuild_code(
             if callflow_files:
                 products += f", {len(callflow_files)} callflow HTML"
             print(f"[graphify watch] {products} updated in {out}")
+        _print_error_summary(issues)
         return True
 
     except Exception as exc:
         print(f"[graphify watch] Rebuild failed: {exc}")
+        _append_issue(
+            issues,
+            stage="rebuild",
+            item="update pipeline",
+            message=str(exc),
+            impact="update aborted before outputs were finalized",
+            partial=True,
+        )
+        _print_error_summary(issues)
         return False
 
 

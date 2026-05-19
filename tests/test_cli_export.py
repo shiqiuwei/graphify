@@ -70,6 +70,20 @@ def test_export_html_creates_file(tmp_path):
     assert html.stat().st_size > 0
 
 
+def test_export_html_uses_configured_node_limit(tmp_path):
+    _make_graph(tmp_path)
+    env = os.environ.copy()
+    env["GRAPHIFY_VIZ_NODE_LIMIT"] = "2"
+
+    r = _run(["export", "html"], tmp_path, env=env)
+
+    assert r.returncode == 0, r.stderr
+    assert "aggregated" in r.stdout.lower()
+    html = tmp_path / "graphify-out" / "graph.html"
+    assert html.exists()
+    assert html.stat().st_size > 0
+
+
 def test_export_html_no_viz_removes_file(tmp_path):
     out = _make_graph(tmp_path)
     (out / "graph.html").write_text("<html/>")

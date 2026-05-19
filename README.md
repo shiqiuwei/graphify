@@ -267,6 +267,10 @@ dist/
 !src/**
 ```
 
+Leading `/` stays anchored to the directory that contains that `.graphifyignore`,
+and standard allowlist patterns like `*`, `!*/`, and `!**/*.js` work the same
+way they do in `.gitignore`.
+
 ---
 
 ## Team setup
@@ -320,6 +324,9 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 | `ANTHROPIC_API_KEY` | Claude (Anthropic) backend | `--backend claude` |
 | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Google Gemini backend | `--backend gemini` |
 | `OPENAI_API_KEY` | OpenAI or OpenAI-compatible APIs | `--backend openai` |
+| `OPENAI_BASE_URL` or `GRAPHIFY_OPENAI_BASE_URL` | OpenAI-compatible gateway base URL | optional for `--backend openai`; defaults to `https://api.openai.com/v1` |
+| `GRAPHIFY_OPENAI_API_STYLE` | Force `chat`, `responses`, or `auto` for OpenAI-compatible gateways | optional for `--backend openai`; default `auto` |
+| `GRAPHIFY_OPENAI_RESPONSES_MODE` | Force `nonstream`, `stream`, or `auto` for `/responses` calls | optional for `--backend openai`; default `auto` |
 | `DEEPSEEK_API_KEY` | DeepSeek backend | `--backend deepseek` |
 | `MOONSHOT_API_KEY` | Kimi Code backend | `--backend kimi` |
 | `OLLAMA_BASE_URL` | Ollama local inference URL | `--backend ollama` (default: `http://localhost:11434`) |
@@ -331,9 +338,17 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 | `GRAPHIFY_MAX_OUTPUT_TOKENS` | Raise output cap for dense corpora | optional — e.g. `32768` for large files |
 | `GRAPHIFY_API_TIMEOUT` | HTTP timeout in seconds (default: 600) | optional — also `--api-timeout` flag |
 | `GRAPHIFY_FORCE` | Force graph rebuild even with fewer nodes | optional — also `--force` flag |
+| `GRAPHIFY_VIZ_NODE_LIMIT` | HTML viz node limit for `export html` / `cluster-only` / watch rebuilds | optional — default `20000`; set `0` to disable HTML output |
 | `GRAPHIFY_GOOGLE_WORKSPACE` | Auto-enable Google Workspace export | optional — set to `1` |
 | `GRAPHIFY_TRIAGE_BACKEND` | Backend for `graphify prs --triage` | optional — auto-detected from available keys |
 | `GRAPHIFY_TRIAGE_MODEL` | Model override for triage | optional — e.g. `claude-opus-4-7` |
+
+For OpenAI-compatible gateways, headless `--backend openai` defaults to
+`gpt-5.4` and `GRAPHIFY_OPENAI_API_STYLE=auto`: graphify tries
+`/chat/completions` first, then automatically retries with `/responses` if the
+gateway rejects `messages` or chat-style parameters. If a provider only returns
+complete text reliably over streaming SSE, set
+`GRAPHIFY_OPENAI_RESPONSES_MODE=stream`; otherwise leave it on `auto`.
 
 ---
 
@@ -375,11 +390,14 @@ The KV-cache window is auto-sized but may be too large for your GPU. Reduce it:
 GRAPHIFY_OLLAMA_NUM_CTX=8192 graphify extract ./docs --backend ollama --token-budget 4000
 ```
 
-**Graph HTML is too large to open in a browser (>5000 nodes)**
-Skip HTML generation and use the JSON directly:
+**Graph HTML is too large to open in a browser**
+By default graphify writes HTML up to `GRAPHIFY_VIZ_NODE_LIMIT=20000` nodes.
+If you want a lower cap, or want to disable HTML entirely in CI, set the env var
+explicitly and fall back to JSON/query flows:
 ```bash
 graphify cluster-only ./my-project --no-viz
 graphify query "..."
+GRAPHIFY_VIZ_NODE_LIMIT=0 graphify export html --no-viz
 ```
 
 **`graph.json` has conflict markers after two devs commit at once**
@@ -390,6 +408,25 @@ Docs and PDFs require an LLM call. Check that your API key is set and the backen
 ```bash
 ANTHROPIC_API_KEY=sk-... graphify extract ./docs --backend claude
 ```
+
+**OpenAI-compatible gateway rejects `messages` or `/chat/completions`**
+Graphify already auto-retries with `/responses` when `GRAPHIFY_OPENAI_API_STYLE=auto`.
+If you know your provider is Responses-only, pin it explicitly:
+```bash
+OPENAI_BASE_URL=https://gateway.example/v1 GRAPHIFY_OPENAI_API_STYLE=responses graphify extract ./docs --backend openai
+```
+
+**OpenAI-compatible gateway returns 200 OK but empty text**
+Some gateways only emit usable `/responses` output in streaming mode. Force SSE:
+```bash
+GRAPHIFY_OPENAI_RESPONSES_MODE=stream graphify extract ./docs --backend openai
+```
+
+**Headless extract finished with warnings or partial semantic results**
+`graphify extract` now prints an `Error Summary` at the end of the run. If a
+semantic chunk fails, graphify still writes the successful outputs and leaves
+the failed files without a `semantic_hash` in `manifest.json`, so the next
+incremental `graphify extract` retries only those files.
 
 **Skill version mismatch warning in your IDE**
 Your installed graphify version is different from the skill file. Update:
@@ -453,6 +490,9 @@ graphify antigravity install / uninstall
 graphify extract ./docs                        # headless LLM extraction for CI (no IDE needed)
 graphify extract ./docs --backend gemini       # explicit backend: gemini, kimi, claude, openai, deepseek, ollama, bedrock, or claude-cli
 graphify extract ./docs --backend gemini --model gemini-3.1-pro-preview
+OPENAI_BASE_URL=https://gateway.example/v1 graphify extract ./docs --backend openai
+GRAPHIFY_OPENAI_API_STYLE=responses graphify extract ./docs --backend openai
+GRAPHIFY_OPENAI_RESPONSES_MODE=stream graphify extract ./docs --backend openai
 graphify extract ./docs --backend ollama       # local Ollama (set OLLAMA_BASE_URL / OLLAMA_MODEL) - no API key needed for loopback
 GRAPHIFY_OLLAMA_NUM_CTX=32768 graphify extract ./docs --backend ollama   # override KV-cache window (auto-sized by default)
 GRAPHIFY_OLLAMA_KEEP_ALIVE=0 graphify extract ./docs --backend ollama    # unload model after each chunk (saves VRAM on small GPUs)

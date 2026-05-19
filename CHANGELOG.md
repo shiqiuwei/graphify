@@ -2,6 +2,17 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased
+
+- Feat: `--backend openai` now supports `OPENAI_BASE_URL` / `GRAPHIFY_OPENAI_BASE_URL` overrides for OpenAI-compatible gateways, and the default headless model is now `gpt-5.4`
+- Feat: `GRAPHIFY_OPENAI_API_STYLE` (`chat|responses|auto`) and `GRAPHIFY_OPENAI_RESPONSES_MODE` (`nonstream|stream|auto`) let you pin gateway compatibility behaviour when needed
+- Feat: `graphify extract` now prints a structured `Error Summary` at the end of the run so chunk-level warnings and partial outputs are visible without digging through logs
+- Feat: HTML viz now defaults to a `20000`-node limit, still honors `GRAPHIFY_VIZ_NODE_LIMIT`, and treats `0` as "disable HTML output"
+- Fix: when an OpenAI-compatible gateway rejects chat-style `messages` or `/chat/completions`, graphify now auto-retries via `/responses`, with an extra streaming retry path for gateways that return empty non-stream text
+- Fix: semantic files that fail during headless extraction now keep an empty `semantic_hash`, so the next incremental `graphify extract` retries only the failed files instead of reprocessing the full corpus
+- Fix: `.graphifyignore` now follows standard gitignore slash semantics for anchored and `**` patterns, so rules like `/*.js` and `* !*/ !**/*.js` behave correctly at any depth
+- Fix: `claude-cli` invocations now execute the resolved `claude` binary path instead of relying on a second PATH lookup inside `subprocess.run()`
+
 ## 0.8.10 (2026-05-17)
 
 - Fix: git hooks phantom directory on git < 2.31 — drop `--path-format=absolute`, validate path contains no newlines, anchor relative paths on repo root (#907)

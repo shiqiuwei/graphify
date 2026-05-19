@@ -206,9 +206,22 @@ Token 压缩效果会随着语料规模增大而更明显。6 个文件本来就
 
 graphify 会把文档、论文和图片的内容发送给你所用 AI 编码助手背后的模型 API 来做语义提取 —— 可能是 Anthropic（Claude Code）、OpenAI（Codex），或者你当前平台使用的其他提供方。代码文件则完全在本地通过 tree-sitter AST 处理，不会把代码内容发出去。项目本身没有任何遥测、使用跟踪或分析。唯一的网络请求就是语义提取阶段调用你平台自己的模型 API，使用的也是你自己的 API key。
 
+## OpenAI 兼容网关（无头提取）
+
+如果你是在 IDE 外直接跑 `graphify extract ./docs --backend openai`，现在可以把它指向任意 OpenAI-compatible 网关：
+
+- `OPENAI_BASE_URL` 或 `GRAPHIFY_OPENAI_BASE_URL`：覆盖基础地址，默认是 `https://api.openai.com/v1`
+- `GRAPHIFY_OPENAI_API_STYLE`：强制使用 `chat`、`responses` 或 `auto`；默认 `auto`
+- `GRAPHIFY_OPENAI_RESPONSES_MODE`：强制 `/responses` 走 `nonstream`、`stream` 或 `auto`；默认 `auto`
+- `--backend openai` 的默认模型现在是 `gpt-5.4`
+
+默认的 `auto` 策略会先尝试 `/chat/completions`；如果网关报 `messages` 或 `/chat/completions` 不受支持，会自动回退到 `/responses`。如果某些网关在非流式 `/responses` 下返回 200 但正文为空，可以把 `GRAPHIFY_OPENAI_RESPONSES_MODE=stream` 固定下来。
+
+现在 `graphify extract` 在无头模式结束时还会输出一个 `Error Summary`。如果某个语义 chunk 失败，graphify 会保留已经成功的产物，并让对应文件在 `manifest.json` 里保持空的 `semantic_hash`，这样下一次增量 `graphify extract` 只会重试这些失败文件，而不是整批重跑。
+
 ## 技术栈
 
-NetworkX + Leiden（graspologic）+ tree-sitter + vis.js。语义提取由 Claude（Claude Code）、GPT-4（Codex）或你当前平台所运行的模型完成。不需要 Neo4j，不需要 server，整体是纯本地运行。
+NetworkX + Leiden（graspologic）+ tree-sitter + vis.js。语义提取由 Claude（Claude Code）、OpenAI 兼容模型（无头 `--backend openai` 默认是 `gpt-5.4`）或你当前平台所运行的模型完成。不需要 Neo4j，不需要 server，整体是纯本地运行。
 
 <details>
 <summary>贡献</summary>
